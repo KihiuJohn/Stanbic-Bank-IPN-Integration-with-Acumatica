@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
@@ -7,123 +8,141 @@ using Newtonsoft.Json;
 using PX.Data;
 using PX.Common;
 using PX.Api.Webhooks;
+using PX.Objects.GL;
+using System.Linq;
 
 namespace StanbicBankIntegration
 {
     public class StanbicWebhookHandler : IWebhookHandler
     {
-        // Parameterless constructor is mandatory for the Webhooks screen to discover the class
         public StanbicWebhookHandler() { }
 
         public async Task HandleAsync(WebhookContext context, CancellationToken cancellationToken)
         {
+            string jsonBody = string.Empty;
             try
             {
-                await ProcessRequest(context, cancellationToken);
+                using (var reader = new StreamReader(context.Request.Body, Encoding.UTF8))
+                {
+                    jsonBody = await reader.ReadToEndAsync();
+                }
+
+                if (string.IsNullOrWhiteSpace(jsonBody))
+                {
+                    context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                    return;
+                }
+
+                var result = await Task.Run(() => ProcessWebhook(jsonBody), cancellationToken);
+
+                context.Response.StatusCode = StatusCodes.Status200OK;
+                using (var sw = new StreamWriter(context.Response.Body, Encoding.UTF8))
+                {
+                    await sw.WriteAsync(result);
+                }
             }
             catch (Exception ex)
             {
-                PXTrace.WriteError($"{Messages.ErrorDuringWebhookProcessing}: {ex.Message}");
-                // Return 500 to the sender so they know to retry
                 context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                using (var sw = new StreamWriter(context.Response.Body, Encoding.UTF8))
+                {
+                    await sw.WriteAsync($"Error: {ex.Message}");
+                }
             }
         }
 
-        private async Task ProcessRequest(WebhookContext context, CancellationToken cancellationToken)
+        private string ProcessWebhook(string json)
         {
-            string json;
-            using (var reader = new StreamReader(context.Request.Body))
-            {
-                json = await reader.ReadToEndAsync();
-            }
+            // Ensure 'Company' matches the Tenant Name in the login screen
+            string loginUser = "gibbs@Company";
 
-            if (string.IsNullOrWhiteSpace(json))
+            using (new PXLoginScope(loginUser))
             {
-                PXTrace.WriteWarning(LogMessages.InvalidPayload);
-                context.Response.StatusCode = StatusCodes.Status400BadRequest;
-                return;
-            }
+                // This sets the context so Acumatica knows which CompanyID to use automatically
+                PXContext.SetScreenID("SM304000");
 
-            StanbicPayload payload;
-            try
-            {
-                payload = JsonConvert.DeserializeObject<StanbicPayload>(json);
-            }
-            catch (Exception ex)
-            {
-                PXTrace.WriteError(LogMessages.DeserializationError, ex.Message);
-                context.Response.StatusCode = StatusCodes.Status400BadRequest;
-                return;
-            }
-
-            // Parse Amount and Currency (Expected: "KES 100.00")
-            string currency = "KES";
-            decimal? amount = null;
-            if (!string.IsNullOrEmpty(payload.TransAmount))
-            {
-                var parts = payload.TransAmount.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length >= 2)
+                try
                 {
-                    currency = parts[0];
-                    if (decimal.TryParse(parts[1].Replace(",", ""), out decimal parsed)) amount = parsed;
+                    StanbicPayload payload = JsonConvert.DeserializeObject<StanbicPayload>(json);
+                    if (payload == null || string.IsNullOrEmpty(payload.TransID))
+                        return "Error: Payload is empty or TransID is missing.";
+
+                    // Parsing the Amount (handling "KES 100.00" format)
+                    decimal parsedAmount = 0;
+                    string currency = "KES";
+                    if (!string.IsNullOrEmpty(payload.TransAmount))
+                    {
+                        var parts = payload.TransAmount.Split(' ');
+                        if (parts.Length > 1)
+                        {
+                            currency = parts[0];
+                            decimal.TryParse(parts[1].Replace(",", ""), out parsedAmount);
+                        }
+                        else
+                        {
+                            decimal.TryParse(parts[0].Replace(",", ""), out parsedAmount);
+                        }
+                    }
+
+                    // PXDatabase.Insert will AUTOMATICALLY add CompanyID based on the 'gibbs@Company' login.
+                    // DO NOT add CompanyID here or you will get the "Specified more than once" error.
+                    PXDatabase.Insert<StanbicBankTxn>(
+                        new PXDataFieldAssign<StanbicBankTxn.transID>(payload.TransID),
+                        new PXDataFieldAssign<StanbicBankTxn.transactionType>(payload.TransactionType),
+                        new PXDataFieldAssign<StanbicBankTxn.transTime>(payload.TransTime),
+                        new PXDataFieldAssign<StanbicBankTxn.transAmount>(parsedAmount),
+                        new PXDataFieldAssign<StanbicBankTxn.currency>(currency),
+                        new PXDataFieldAssign<StanbicBankTxn.businessShortCode>(payload.BusinessShortCode),
+                        new PXDataFieldAssign<StanbicBankTxn.businessAccountNo>(payload.BusinessAccountNo),
+                        new PXDataFieldAssign<StanbicBankTxn.billRefNumber>(payload.BillRefNumber),
+                        new PXDataFieldAssign<StanbicBankTxn.invoiceNumber>(payload.InvoiceNumber),
+                        new PXDataFieldAssign<StanbicBankTxn.orgAccountBalance>(payload.OrgAccountBalance),
+                        new PXDataFieldAssign<StanbicBankTxn.availableAccountBalance>(payload.AvailableAccountBalance),
+                        new PXDataFieldAssign<StanbicBankTxn.thirdPartyTransID>(payload.ThirdPartyTransID),
+                        new PXDataFieldAssign<StanbicBankTxn.mSISDN>(payload.MSISDN),
+                        new PXDataFieldAssign<StanbicBankTxn.paymentDetails>(payload.FirstName + " " + payload.LastName),
+                        new PXDataFieldAssign<StanbicBankTxn.secureHash>(payload.secureHash),
+                        new PXDataFieldAssign<StanbicBankTxn.rawPayload>(json),
+                        new PXDataFieldAssign<StanbicBankTxn.status>("New"),
+                        new PXDataFieldAssign<StanbicBankTxn.createdByScreenID>("SM304000"),
+                        new PXDataFieldAssign<StanbicBankTxn.createdDateTime>(DateTime.UtcNow)
+                    );
+
+                    // Verification
+                    var row = PXDatabase.SelectSingle<StanbicBankTxn>(
+                        new PXDataField("TransID"),
+                        new PXDataFieldValue("TransID", payload.TransID));
+
+                    if (row != null)
+                        return $"Success: Trans {payload.TransID} is now in the database.";
+                    else
+                        return "Error: Insert appeared to work but record is not visible. Verify Tenant name 'Company' is correct.";
                 }
-                else if (decimal.TryParse(payload.TransAmount.Replace(",", ""), out decimal parsed))
+                catch (Exception ex)
                 {
-                    amount = parsed;
+                    return $"Final Error: {ex.Message}";
                 }
             }
-
-            // Note: Add security verification here later (header check + hash validation)
-
-            // Establish Login Scope to allow DB persistence
-            // 'admin' should be a valid user in the target tenant
-            using (new PXLoginScope("admin"))
-            {
-                var graph = PXGraph.CreateInstance<PXGraph>();
-                var txn = new StanbicBankTxn
-                {
-                    TransID = payload.TransID,
-                    TransactionType = payload.TransactionType,
-                    TransTime = payload.TransTime,
-                    TransAmount = amount,
-                    Currency = currency,
-                    MSISDN = payload.MSISDN,
-                    BillRefNumber = payload.BillRefNumber,
-                    ThirdPartyTransID = payload.ThirdPartyTransID,
-                    SecureHash = payload.secureHash,
-                    RawPayload = json,
-                    Status = "New"
-                };
-                graph.Caches[typeof(StanbicBankTxn)].Insert(txn);
-                // Persist the data to the custom table
-                graph.Persist();
-            }
-
-            PXTrace.WriteInformation(LogMessages.ProcessingSuccess, payload.TransID);
-            context.Response.StatusCode = StatusCodes.Status200OK;
         }
-    }
 
-    public class StanbicPayload
-    {
-        public string TransactionType { get; set; }
-        public string TransID { get; set; }
-        public string TransTime { get; set; }
-        public string TransAmount { get; set; }
-        public string BusinessShortCode { get; set; }
-        public string BusinessAccountNo { get; set; }
-        public string BillRefNumber { get; set; }
-        public string InvoiceNumber { get; set; }
-        public string OrgAccountBalance { get; set; }
-        public string AvailableAccountBalance { get; set; }
-        public string ThirdPartyTransID { get; set; }
-        public string MSISDN { get; set; }
-        public string PaymentDetails { get; set; }
-        public string CallbackUrl { get; set; }
-        public string apiClientId { get; set; }
-        public string ApiSecret { get; set; }
-        public object dealReference { get; set; }
-        public string ApiKey { get; set; }
-        public string secureHash { get; set; }
+        // Ensure your Payload class matches the Stanbic JSON structure
+        public class StanbicPayload
+        {
+            public string TransactionType { get; set; }
+            public string TransID { get; set; }
+            public string TransTime { get; set; }
+            public string TransAmount { get; set; }
+            public string BusinessShortCode { get; set; }
+            public string BusinessAccountNo { get; set; }
+            public string BillRefNumber { get; set; }
+            public string InvoiceNumber { get; set; }
+            public string OrgAccountBalance { get; set; }
+            public string AvailableAccountBalance { get; set; }
+            public string ThirdPartyTransID { get; set; }
+            public string MSISDN { get; set; }
+            public string FirstName { get; set; }
+            public string LastName { get; set; }
+            public string secureHash { get; set; }
+        }
     }
 }
