@@ -68,6 +68,7 @@
     <Compile Include="Messages.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="StanbicBankTxn.cs" />
+    <Compile Include="StanbicReconProcess.cs" />
     <Compile Include="StanbicWebhookHandler.cs" />
     <Compile Include="StanbicWebhookLog.cs" />
   </ItemGroup>

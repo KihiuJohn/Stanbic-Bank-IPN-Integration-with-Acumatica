@@ -53,76 +53,76 @@ namespace StanbicBankIntegration
 
         private string ProcessWebhook(string json)
         {
-            // Ensure 'Company' matches the Tenant Name in the login screen
             string loginUser = "gibbs@Company";
 
             using (new PXLoginScope(loginUser))
             {
-                // This sets the context so Acumatica knows which CompanyID to use automatically
                 PXContext.SetScreenID("SM304000");
 
                 try
                 {
                     StanbicPayload payload = JsonConvert.DeserializeObject<StanbicPayload>(json);
-                    if (payload == null || string.IsNullOrEmpty(payload.TransID))
-                        return "Error: Payload is empty or TransID is missing.";
 
-                    // Parsing the Amount (handling "KES 100.00" format)
+                    // 1. DUPLICATE CHECK (Prevents the PK Violation Error)
+                    var existing = PXDatabase.SelectSingle<StanbicBankTxn>(
+                        new PXDataField("TransID"),
+                        new PXDataFieldValue("TransID", payload.TransID));
+
+                    if (existing != null)
+                    {
+                        WriteLog(payload.TransID, "INFO", $"Duplicate ignored: {payload.TransID}");
+                        return $"Success: Transaction {payload.TransID} already exists.";
+                    }
+
+                    // 2. PARSE DATA
                     decimal parsedAmount = 0;
                     string currency = "KES";
                     if (!string.IsNullOrEmpty(payload.TransAmount))
                     {
                         var parts = payload.TransAmount.Split(' ');
-                        if (parts.Length > 1)
-                        {
-                            currency = parts[0];
-                            decimal.TryParse(parts[1].Replace(",", ""), out parsedAmount);
-                        }
-                        else
-                        {
-                            decimal.TryParse(parts[0].Replace(",", ""), out parsedAmount);
-                        }
+                        if (parts.Length > 1) { currency = parts[0]; decimal.TryParse(parts[1].Replace(",", ""), out parsedAmount); }
+                        else { decimal.TryParse(parts[0].Replace(",", ""), out parsedAmount); }
                     }
 
-                    // PXDatabase.Insert will AUTOMATICALLY add CompanyID based on the 'gibbs@Company' login.
-                    // DO NOT add CompanyID here or you will get the "Specified more than once" error.
+                    // 3. DIRECT INSERT TRANSACTION
                     PXDatabase.Insert<StanbicBankTxn>(
                         new PXDataFieldAssign<StanbicBankTxn.transID>(payload.TransID),
                         new PXDataFieldAssign<StanbicBankTxn.transactionType>(payload.TransactionType),
-                        new PXDataFieldAssign<StanbicBankTxn.transTime>(payload.TransTime),
                         new PXDataFieldAssign<StanbicBankTxn.transAmount>(parsedAmount),
                         new PXDataFieldAssign<StanbicBankTxn.currency>(currency),
-                        new PXDataFieldAssign<StanbicBankTxn.businessShortCode>(payload.BusinessShortCode),
-                        new PXDataFieldAssign<StanbicBankTxn.businessAccountNo>(payload.BusinessAccountNo),
                         new PXDataFieldAssign<StanbicBankTxn.billRefNumber>(payload.BillRefNumber),
-                        new PXDataFieldAssign<StanbicBankTxn.invoiceNumber>(payload.InvoiceNumber),
-                        new PXDataFieldAssign<StanbicBankTxn.orgAccountBalance>(payload.OrgAccountBalance),
-                        new PXDataFieldAssign<StanbicBankTxn.availableAccountBalance>(payload.AvailableAccountBalance),
-                        new PXDataFieldAssign<StanbicBankTxn.thirdPartyTransID>(payload.ThirdPartyTransID),
                         new PXDataFieldAssign<StanbicBankTxn.mSISDN>(payload.MSISDN),
-                        new PXDataFieldAssign<StanbicBankTxn.paymentDetails>(payload.FirstName + " " + payload.LastName),
-                        new PXDataFieldAssign<StanbicBankTxn.secureHash>(payload.secureHash),
                         new PXDataFieldAssign<StanbicBankTxn.rawPayload>(json),
                         new PXDataFieldAssign<StanbicBankTxn.status>("New"),
-                        new PXDataFieldAssign<StanbicBankTxn.createdByScreenID>("SM304000"),
                         new PXDataFieldAssign<StanbicBankTxn.createdDateTime>(DateTime.UtcNow)
                     );
 
-                    // Verification
-                    var row = PXDatabase.SelectSingle<StanbicBankTxn>(
-                        new PXDataField("TransID"),
-                        new PXDataFieldValue("TransID", payload.TransID));
+                    // 4. DIRECT INSERT LOG
+                    WriteLog(payload.TransID, "SUCCESS", $"Recorded payment for {payload.BillRefNumber}");
 
-                    if (row != null)
-                        return $"Success: Trans {payload.TransID} is now in the database.";
-                    else
-                        return "Error: Insert appeared to work but record is not visible. Verify Tenant name 'Company' is correct.";
+                    return $"Success: Trans {payload.TransID} saved.";
                 }
                 catch (Exception ex)
                 {
-                    return $"Final Error: {ex.Message}";
+                    WriteLog("SYSTEM", "ERROR", ex.Message);
+                    return $"Error: {ex.Message}";
                 }
             }
+        }
+
+        // Helper method to ensure logs save regardless of graph state
+        private void WriteLog(string transID, string level, string message, string exception = null)
+        {
+            // Direct SQL insert to bypass any transaction rollbacks
+            PXDatabase.Insert<StanbicWebhookLog>(
+                new PXDataFieldAssign<StanbicWebhookLog.transID>(transID),
+                new PXDataFieldAssign<StanbicWebhookLog.logLevel>(level),
+                new PXDataFieldAssign<StanbicWebhookLog.message>(message),
+                new PXDataFieldAssign<StanbicWebhookLog.exception>(exception),
+                new PXDataFieldAssign<StanbicWebhookLog.eventTime>(DateTime.Now),
+                new PXDataFieldAssign<StanbicWebhookLog.createdByScreenID>("SM304000"),
+                new PXDataFieldAssign<StanbicWebhookLog.createdDateTime>(DateTime.UtcNow)
+            );
         }
 
         // Ensure your Payload class matches the Stanbic JSON structure

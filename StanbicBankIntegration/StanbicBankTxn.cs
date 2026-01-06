@@ -1,6 +1,7 @@
 ﻿using System;
 using PX.Data;
 using PX.Data.BQL;
+using PX.Objects.AR;
 
 namespace StanbicBankIntegration
 {
@@ -17,6 +18,38 @@ namespace StanbicBankIntegration
         public virtual int? CompanyID { get; set; }
         public abstract class companyID : BqlInt.Field<companyID> { }
 #pragma warning restore PX1027
+        #endregion
+
+        #region NoteID
+        public abstract class noteID : BqlGuid.Field<noteID> { }
+        [PXNote]
+        public virtual Guid? NoteID { get; set; }
+        #endregion
+
+        #region CustomerID
+        public abstract class customerID : BqlInt.Field<customerID> { }
+        [Customer(DescriptionField = typeof(Customer.acctName), DisplayName = "Customer")]
+        public virtual int? CustomerID { get; set; }
+        #endregion
+
+        #region InvoiceRefNbr
+        public abstract class invoiceRefNbr : BqlString.Field<invoiceRefNbr> { }
+        [PXDBString(15, IsUnicode = true)]
+        [PXUIField(DisplayName = "Invoice Nbr.")]
+        [ARInvoiceType.RefNbr(typeof(Search<ARInvoice.refNbr,
+            Where<ARInvoice.customerID, Equal<Current<StanbicBankTxn.customerID>>,
+            And<ARInvoice.docType, Equal<ARDocType.invoice>>>>))]
+        public virtual string InvoiceRefNbr { get; set; }
+        #endregion
+
+        #region Status
+        public abstract class status : BqlString.Field<status> { }
+        [PXDBString(20, IsUnicode = true)]
+        [PXUIField(DisplayName = "Status", Enabled = false)]
+        [PXDefault("New")]
+        [PXStringList(new string[] { "New", "Processed", "Error" },
+                      new string[] { "New", "Processed", "Error" })]
+        public virtual string Status { get; set; }
         #endregion
 
         #region TransID
@@ -129,14 +162,6 @@ namespace StanbicBankIntegration
         [PXUIField(DisplayName = "Raw JSON Payload")]
         public virtual string RawPayload { get; set; }
         public abstract class rawPayload : BqlString.Field<rawPayload> { }
-        #endregion
-
-        #region Status
-        [PXDBString(20, IsUnicode = true)]
-        [PXUIField(DisplayName = "Status")]
-        [PXDefault("New")]
-        public virtual string Status { get; set; }
-        public abstract class status : BqlString.Field<status> { }
         #endregion
 
         #region System Audit Fields (Fixes PX1069)
